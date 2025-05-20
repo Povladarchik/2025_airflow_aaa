@@ -1,17 +1,14 @@
-import argparse
 import os
 from datetime import timedelta
-
 import polars as pl
 from scipy.sparse import csr_matrix
 import numpy as np
 import implicit
 import mlflow
-import mlflow.sklearn
-
+import argparse
 
 EVAL_DAYS_TRESHOLD = 14
-DATA_DIR = os.getenv("DATA_DIR", "data")
+DATA_DIR = os.getenv("DATA_DIR", "data/")
 EXPERIMENT_NAME = os.getenv("EXPERIMENT_NAME", "homework-ispopravka")
 
 
@@ -23,13 +20,10 @@ def get_data():
 
 
 def split_train_test(df_clickstream: pl.DataFrame, df_event: pl.DataFrame):
-    treshhold = df_clickstream['event_date'].max() - timedelta(days=EVAL_DAYS_TRESHOLD)
-
-    df_train = df_clickstream.filter(df_clickstream['event_date'] <= treshhold)
-    df_eval = df_clickstream.filter(df_clickstream['event_date'] > treshhold)[['cookie', 'node', 'event']]
-
+    threshold = df_clickstream['event_date'].max() - timedelta(days=EVAL_DAYS_TRESHOLD)
+    df_train = df_clickstream.filter(df_clickstream['event_date'] <= threshold)
+    df_eval = df_clickstream.filter(df_clickstream['event_date'] > threshold)[['cookie', 'node', 'event']]
     df_eval = df_eval.join(df_train, on=['cookie', 'node'], how='anti')
-
     df_eval = df_eval.filter(
         pl.col('event').is_in(
             df_event.filter(pl.col('is_contact') == 1)['event'].unique()
@@ -40,9 +34,7 @@ def split_train_test(df_clickstream: pl.DataFrame, df_event: pl.DataFrame):
     ).filter(
         pl.col('node').is_in(df_train['node'].unique())
     )
-
     df_eval = df_eval.unique(['cookie', 'node'])
-
     return df_train, df_eval
 
 
@@ -55,7 +47,6 @@ def get_als_pred(users, nodes, user_to_pred,
                  als_iterations=15,
                  als_regularization=0.01,
                  data_frac=1.0):
-
     if data_frac < 1.0:
         sample_size = int(len(users) * data_frac)
         indices = np.random.choice(len(users), size=sample_size, replace=False)
@@ -64,10 +55,9 @@ def get_als_pred(users, nodes, user_to_pred,
 
     user_ids = users.unique().to_list()
     item_ids = nodes.unique().to_list()
-
     user_id_to_index = {user_id: idx for idx, user_id in enumerate(user_ids)}
     item_id_to_index = {item_id: idx for idx, item_id in enumerate(item_ids)}
-    index_to_item_id = {v:k for k,v in item_id_to_index.items()}
+    index_to_item_id = {v: k for k, v in item_id_to_index.items()}
 
     rows = [user_id_to_index[user] for user in users]
     cols = [item_id_to_index[item] for item in nodes]
@@ -78,7 +68,6 @@ def get_als_pred(users, nodes, user_to_pred,
         values = [1.0] * len(rows)
 
     values = [v * als_alpha for v in values]
-
     sparse_matrix = csr_matrix((values, (rows, cols)), shape=(len(user_ids), len(item_ids)))
 
     model = implicit.als.AlternatingLeastSquares(
@@ -90,7 +79,6 @@ def get_als_pred(users, nodes, user_to_pred,
     model.fit(sparse_matrix)
 
     user4pred = np.array([user_id_to_index[user] for user in user_to_pred])
-
     recommendations, scores = model.recommend(
         user4pred,
         sparse_matrix[user4pred],
@@ -104,7 +92,6 @@ def get_als_pred(users, nodes, user_to_pred,
         'scores': scores.tolist()
     })
     df_pred = df_pred.explode(['node', 'scores'])
-
     return df_pred
 
 
@@ -119,14 +106,26 @@ def recall_at(df_true, df_pred, k=40):
         'cookie'
     ).agg(
         [
-            pl.col('value').sum() / pl.col(
-                'value'
-            ).count()
+            pl.col('value').sum() / pl.col('value').count()
         ]
     )['value'].mean()
 
 
-def main():
+def train(df_train: pl.DataFrame, df_eval: pl.DataFrame, model_name: str,
+          **kwargs):
+    users = df_train["cookie"]
+    nodes = df_train["node"]
+    eval_users = df_eval['cookie'].unique().to_list()
+
+    if model_name == "als":
+        df_pred = get_als_pred(users, nodes, eval_users, **kwargs)
+    else:
+        raise ValueError(f"Model {model_name} not implemented")
+
+    return df_pred
+
+
+def parse_args():
     parser = argparse.ArgumentParser(description="Train ALS model with parameters")
     parser.add_argument("--run_name", type=str, required=True, help="Name of the run")
     parser.add_argument("--model_type", type=str, default="als", help="Model to use")
@@ -137,9 +136,15 @@ def main():
     parser.add_argument("--als_data_frac", type=float, default=1.0, help="Data fraction")
     parser.add_argument("--als_data_prep", type=str, default="binary", help="Data prep method")
     parser.add_argument("--als_decay_rate", type=float, default=0.0, help="Decay rate for time-weighted binary")
-
     args = parser.parse_args()
 
+    return args
+
+
+def main():
+    args = parse_args()
+
+    # Set up MLflow
     mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI"))
     if not mlflow.get_experiment_by_name(EXPERIMENT_NAME):
         mlflow.create_experiment(EXPERIMENT_NAME, artifact_location='mlflow-artifacts:/')
@@ -148,21 +153,23 @@ def main():
     with mlflow.start_run(run_name=args.run_name):
         df_test_users, df_clickstream, df_event = get_data()
         df_train, df_eval = split_train_test(df_clickstream, df_event)
-        df_pred = get_als_pred(
-            df_train["cookie"], df_train["node"], df_eval['cookie'].unique().to_list(),
-            als_alpha=args.als_alpha,
-            als_factors=args.als_factors,
-            als_iterations=args.als_iterations,
-            als_regularization=args.als_regularization,
-            data_frac=args.als_data_frac,
-            als_data_prep=args.als_data_prep,
-            als_decay_rate=args.als_decay_rate
-        )
 
+        model_kwargs = {
+            "als_alpha": args.als_alpha,
+            "als_factors": args.als_factors,
+            "als_iterations": args.als_iterations,
+            "als_regularization": args.als_regularization,
+            "data_frac": args.als_data_frac,
+            "als_data_prep": args.als_data_prep,
+            "als_decay_rate": args.als_decay_rate
+        }
+
+        df_pred = train(df_train, df_eval, args.model_type, **model_kwargs)
         metric = recall_at(df_eval, df_pred, k=40)
 
         mlflow.log_params(vars(args))
         mlflow.log_metric("Recall_40", metric)
+
 
 if __name__ == "__main__":
     main()
